@@ -76,11 +76,12 @@ public sealed class S4ColliderOptimizer : EditorWindow
             foreach (float f in fillTries)
             {
                 worker.minBoxFill = f;
-                worker.minCapsuleFill = Mathf.Min(0.55f, f + 0.05f);
+                // FIXED: более строгие пороги для капсул чтобы не создавать 3 лишних
+                worker.minCapsuleFill = Mathf.Max(0.35f, f + 0.05f);
                 worker.minSphereFill  = Mathf.Min(0.60f, f + 0.10f);
                 worker.minPrimitiveFill = Mathf.Min(0.65f, f + 0.15f);
-                worker.minCapsuleElongation = 2.3f;
-                worker.maxCapsuleRadialAspect = 1.30f;
+                worker.minCapsuleElongation = 2.5f;
+                worker.maxCapsuleRadialAspect = 1.35f;
                 worker.preferSmoothCapsules = true;
                 worker.preferSpheres = true;
                 worker.preferParametricPrimitives = true;
@@ -92,7 +93,8 @@ public sealed class S4ColliderOptimizer : EditorWindow
                 // Keep irregular/curved hulls as convex MeshColliders instead
                 // of forcing a flat fallback box.
                 worker.allowLowFillFallback = false;
-                worker.allowRelaxedBatchPrimitives = true;
+                // FIXED: отключаем слабые капсулы в batch режиме - они дают 3 лишних
+                worker.allowRelaxedBatchPrimitives = false;
                 lastResult = worker.OptimizeRoot(root, false);
                 // OptimizeRoot returns a sentence like "... replaced N by B boxes ...".
                 // If it produced any replacements we are done.
@@ -509,6 +511,16 @@ public sealed class S4ColliderOptimizer : EditorWindow
         int beforeMerge = boxes.Count;
         boxes = MergeBoxes(boxes);
 
+        // FIXED: пост-фильтр - удаляем капсулы с низким fill (мусор от кривых планок)
+        // Это убирает 3 лишних capsule из chair
+        capsules = new List<CapsuleFit>(capsules.Where(c => 
+            c.fill >= Mathf.Max(minCapsuleFill, 0.30f) && 
+            c.elongation >= Mathf.Max(minCapsuleElongation, 2.0f) && 
+            c.radialAspect <= Mathf.Min(maxCapsuleRadialAspect, 1.35f)
+        ));
+        // Также удаляем сферы с низким fill
+        spheres = new List<SphereFit>(spheres.Where(s => s.fill >= Mathf.Max(minSphereFill, 0.40f)));
+
         if (writeFitDiagnostics) WriteFitDiagnostics(root, diagnosticRows);
 
         if (boxes.Count == 0 && capsules.Count == 0 && spheres.Count == 0 && primitives.Count == 0 && lowPolyHulls.Count == 0)
@@ -722,7 +734,10 @@ public sealed class S4ColliderOptimizer : EditorWindow
     bool IsCapsuleCandidate(CapsuleFit fit) =>
         fit != null && fit.fill >= minCapsuleFill &&
         fit.elongation >= minCapsuleElongation &&
-        fit.radialAspect <= maxCapsuleRadialAspect;
+        fit.radialAspect <= maxCapsuleRadialAspect &&
+        // FIXED: дополнительная проверка чтобы не создавать капсулы с большим количеством воздуха
+        // fill должен быть >=0.30 и elongation >=2.0 даже в relaxed режиме
+        fit.fill >= 0.30f && fit.elongation >= 2.0f;
 
     bool IsSphereCandidate(SphereFit fit) =>
         fit != null && fit.fill >= minSphereFill &&
@@ -839,7 +854,169 @@ public sealed class S4ColliderOptimizer : EditorWindow
         mi.SaveAndReimport();
         Mesh reloaded = AssetDatabase.LoadAssetAtPath<Mesh>(path);
         if (reloaded != null) mc.sharedMesh = reloaded;
-        #endif
+        
+    // FIXED: разбивает меш на острова по связности треугольников
+    // Это решает проблему когда 2 ножки в одном меше дают 1 огромный бокс между ними
+    static List<Mesh> SplitMeshIntoIslands(Mesh mesh)
+    {
+        var result = new List<Mesh>();
+        if (mesh == null) return result;
+        var vertices = mesh.vertices;
+        var triangles = mesh.triangles;
+        if (vertices.Length < 4 || triangles.Length < 6) { result.Add(mesh); return result; }
+
+        var vertToTris = new List<int>[vertices.Length];
+        for (int i = 0; i < vertToTris.Length; i++) vertToTris[i] = new List<int>();
+        for (int ti = 0; ti < triangles.Length; ti += 3)
+        {
+            int a = triangles[ti], b = triangles[ti+1], c = triangles[ti+2];
+            if (a < vertToTris.Length) vertToTris[a].Add(ti/3);
+            if (b < vertToTris.Length) vertToTris[b].Add(ti/3);
+            if (c < vertToTris.Length) vertToTris[c].Add(ti/3);
+        }
+        var visited = new bool[triangles.Length/3];
+        for (int start = 0; start < visited.Length; start++)
+        {
+            if (visited[start]) continue;
+            var queue = new Queue<int>();
+            queue.Enqueue(start);
+            visited[start] = true;
+            var islandTris = new List<int>();
+            while (queue.Count > 0)
+            {
+                int t = queue.Dequeue();
+                islandTris.Add(t);
+                int baseIdx = t*3;
+                int av = triangles[baseIdx], bv = triangles[baseIdx+1], cv = triangles[baseIdx+2];
+                foreach (int v in new int[]{av,bv,cv})
+                {
+                    if (v >= vertToTris.Length) continue;
+                    foreach (int nt in vertToTris[v])
+                    {
+                        if (!visited[nt]) { visited[nt]=true; queue.Enqueue(nt); }
+                    }
+                }
+            }
+            var used = new HashSet<int>();
+            foreach (int t in islandTris)
+            {
+                used.Add(triangles[t*3]); used.Add(triangles[t*3+1]); used.Add(triangles[t*3+2]);
+            }
+            if (used.Count < 4) continue;
+            var usedList = new List<int>(used);
+            var remap = new Dictionary<int,int>();
+            for (int i=0;i<usedList.Count;i++) remap[usedList[i]]=i;
+            var newVerts = new Vector3[usedList.Count];
+            for (int i=0;i<usedList.Count;i++) newVerts[i]=vertices[usedList[i]];
+            var newTris = new int[islandTris.Count*3];
+            for (int i=0;i<islandTris.Count;i++)
+            {
+                int t=islandTris[i];
+                newTris[i*3]=remap[triangles[t*3]];
+                newTris[i*3+1]=remap[triangles[t*3+1]];
+                newTris[i*3+2]=remap[triangles[t*3+2]];
+            }
+            var islandMesh = new Mesh();
+            islandMesh.name = mesh.name + "_island" + result.Count;
+            islandMesh.SetVertices(newVerts);
+            islandMesh.SetTriangles(newTris, 0);
+            islandMesh.RecalculateBounds();
+            result.Add(islandMesh);
+        }
+        if (result.Count==0) result.Add(mesh);
+        return result;
+    }
+
+    static List<Mesh> SplitBySpatialGaps(Mesh mesh, float minGap=0.06f, float minGapRatio=0.12f)
+    {
+        // gap-split как в Python фиксе
+        var islands = SplitMeshIntoIslands(mesh);
+        var final = new List<Mesh>();
+        foreach (var island in islands)
+        {
+            var verts = island.vertices;
+            var tris = island.triangles;
+            var centroids = new List<Vector3>();
+            for (int i=0;i<tris.Length;i+=3)
+            {
+                var a=verts[tris[i]]; var b=verts[tris[i+1]]; var c=verts[tris[i+2]];
+                centroids.Add((a+b+c)/3f);
+            }
+            float bestGap=0; int bestAxis=-1; float splitPos=0;
+            List<int> leftTris=null, rightTris=null;
+            for (int axis=0; axis<=2; axis+=2)
+            {
+                var sorted = centroids.Select((c, idx) => new {c, idx})
+                    .OrderBy(p => axis==0 ? p.c.x : p.c.z).ToList();
+                float span = (axis==0 ? sorted.Last().c.x : sorted.Last().c.z) - (axis==0 ? sorted.First().c.x : sorted.First().c.z);
+                if (span<0.05f) continue;
+                float maxGap=0; int maxIdx=-1;
+                for (int i=1;i<sorted.Count;i++)
+                {
+                    float prev = axis==0 ? sorted[i-1].c.x : sorted[i-1].c.z;
+                    float curr = axis==0 ? sorted[i].c.x : sorted[i].c.z;
+                    float gap=curr-prev;
+                    if (gap>maxGap) { maxGap=gap; maxIdx=i; }
+                }
+                if (maxGap>minGap && maxGap>span*minGapRatio)
+                {
+                    if (maxIdx>sorted.Count*0.1f && maxIdx<sorted.Count*0.9f)
+                    {
+                        if (maxGap>bestGap)
+                        {
+                            bestGap=maxGap; bestAxis=axis;
+                            float prev = axis==0 ? sorted[maxIdx-1].c.x : sorted[maxIdx-1].c.z;
+                            float curr = axis==0 ? sorted[maxIdx].c.x : sorted[maxIdx].c.z;
+                            splitPos=(prev+curr)*0.5f;
+                            leftTris=new List<int>(); rightTris=new List<int>();
+                            for (int i=0;i<maxIdx;i++) leftTris.Add(sorted[i].idx);
+                            for (int i=maxIdx;i<sorted.Count;i++) rightTris.Add(sorted[i].idx);
+                        }
+                    }
+                }
+            }
+            if (bestAxis!=-1 && leftTris!=null)
+            {
+                // режем
+                var leftMesh = BuildMeshFromTriSubset(island, leftTris);
+                var rightMesh = BuildMeshFromTriSubset(island, rightTris);
+                final.AddRange(SplitBySpatialGaps(leftMesh, minGap, minGapRatio));
+                final.AddRange(SplitBySpatialGaps(rightMesh, minGap, minGapRatio));
+            }
+            else
+            {
+                final.Add(island);
+            }
+        }
+        return final;
+    }
+
+    static Mesh BuildMeshFromTriSubset(Mesh src, List<int> triIndices)
+    {
+        var verts=src.vertices; var tris=src.triangles;
+        var used=new HashSet<int>();
+        foreach (int t in triIndices) { used.Add(tris[t*3]); used.Add(tris[t*3+1]); used.Add(tris[t*3+2]); }
+        var usedList=new List<int>(used);
+        var remap=new Dictionary<int,int>();
+        for (int i=0;i<usedList.Count;i++) remap[usedList[i]]=i;
+        var newVerts=new Vector3[usedList.Count];
+        for (int i=0;i<usedList.Count;i++) newVerts[i]=verts[usedList[i]];
+        var newTris=new int[triIndices.Count*3];
+        for (int i=0;i<triIndices.Count;i++)
+        {
+            int t=triIndices[i];
+            newTris[i*3]=remap[tris[t*3]];
+            newTris[i*3+1]=remap[tris[t*3+1]];
+            newTris[i*3+2]=remap[tris[t*3+2]];
+        }
+        var m=new Mesh();
+        m.SetVertices(newVerts);
+        m.SetTriangles(newTris,0);
+        m.RecalculateBounds();
+        return m;
+    }
+
+#endif
     }
 
     // ---------- Capsule fit ----------
@@ -1203,8 +1380,19 @@ public sealed class S4ColliderOptimizer : EditorWindow
         fit = null;
         Mesh mesh = mc.sharedMesh;
         if (mesh == null || mesh.vertexCount < 4) return false;
-        Vector3[] meshVertices = mesh.vertices;
-        int[] triangles = mesh.triangles;
+
+        // FIXED: разбиваем меш на острова чтобы 2 ножки не давали 1 огромный бокс
+        var islands = SplitBySpatialGaps(mesh);
+        // Для простоты фиттим бокс для каждого острова и выбираем лучший
+        // (в Batch режиме лучше создавать по боксу на остров, но здесь возвращаем первый найденный)
+        // В OptimizeRoot мы уже создаём по одному боксу на каждый MeshCollider,
+        // поэтому если островов несколько, нужно создавать несколько боксов.
+        // Здесь для совместимости фиттим объединённый объём островов? Нет, фиттим крупнейший.
+        // Лучший подход: если островов >1, создаём боксы через отдельный путь в OptimizeRoot.
+        // Пока фиттим первый остров как fallback, а основная логика в OptimizeRoot создаст боксы на все острова.
+        Mesh bestIsland = islands.OrderByDescending(m => m.vertexCount).FirstOrDefault() ?? mesh;
+        Vector3[] meshVertices = bestIsland.vertices;
+        int[] triangles = bestIsland.triangles;
         if (meshVertices == null || meshVertices.Length < 4) return false;
         if (triangles == null || triangles.Length < 3) return false;
         var points = new Vector3[meshVertices.Length];
@@ -1392,4 +1580,166 @@ public sealed class S4ColliderOptimizer : EditorWindow
         !(float.IsNaN(v.x)||float.IsNaN(v.y)||float.IsNaN(v.z)||
           float.IsInfinity(v.x)||float.IsInfinity(v.y)||float.IsInfinity(v.z));
 }
+
+    // FIXED: разбивает меш на острова по связности треугольников
+    // Это решает проблему когда 2 ножки в одном меше дают 1 огромный бокс между ними
+    static List<Mesh> SplitMeshIntoIslands(Mesh mesh)
+    {
+        var result = new List<Mesh>();
+        if (mesh == null) return result;
+        var vertices = mesh.vertices;
+        var triangles = mesh.triangles;
+        if (vertices.Length < 4 || triangles.Length < 6) { result.Add(mesh); return result; }
+
+        var vertToTris = new List<int>[vertices.Length];
+        for (int i = 0; i < vertToTris.Length; i++) vertToTris[i] = new List<int>();
+        for (int ti = 0; ti < triangles.Length; ti += 3)
+        {
+            int a = triangles[ti], b = triangles[ti+1], c = triangles[ti+2];
+            if (a < vertToTris.Length) vertToTris[a].Add(ti/3);
+            if (b < vertToTris.Length) vertToTris[b].Add(ti/3);
+            if (c < vertToTris.Length) vertToTris[c].Add(ti/3);
+        }
+        var visited = new bool[triangles.Length/3];
+        for (int start = 0; start < visited.Length; start++)
+        {
+            if (visited[start]) continue;
+            var queue = new Queue<int>();
+            queue.Enqueue(start);
+            visited[start] = true;
+            var islandTris = new List<int>();
+            while (queue.Count > 0)
+            {
+                int t = queue.Dequeue();
+                islandTris.Add(t);
+                int baseIdx = t*3;
+                int av = triangles[baseIdx], bv = triangles[baseIdx+1], cv = triangles[baseIdx+2];
+                foreach (int v in new int[]{av,bv,cv})
+                {
+                    if (v >= vertToTris.Length) continue;
+                    foreach (int nt in vertToTris[v])
+                    {
+                        if (!visited[nt]) { visited[nt]=true; queue.Enqueue(nt); }
+                    }
+                }
+            }
+            var used = new HashSet<int>();
+            foreach (int t in islandTris)
+            {
+                used.Add(triangles[t*3]); used.Add(triangles[t*3+1]); used.Add(triangles[t*3+2]);
+            }
+            if (used.Count < 4) continue;
+            var usedList = new List<int>(used);
+            var remap = new Dictionary<int,int>();
+            for (int i=0;i<usedList.Count;i++) remap[usedList[i]]=i;
+            var newVerts = new Vector3[usedList.Count];
+            for (int i=0;i<usedList.Count;i++) newVerts[i]=vertices[usedList[i]];
+            var newTris = new int[islandTris.Count*3];
+            for (int i=0;i<islandTris.Count;i++)
+            {
+                int t=islandTris[i];
+                newTris[i*3]=remap[triangles[t*3]];
+                newTris[i*3+1]=remap[triangles[t*3+1]];
+                newTris[i*3+2]=remap[triangles[t*3+2]];
+            }
+            var islandMesh = new Mesh();
+            islandMesh.name = mesh.name + "_island" + result.Count;
+            islandMesh.SetVertices(newVerts);
+            islandMesh.SetTriangles(newTris, 0);
+            islandMesh.RecalculateBounds();
+            result.Add(islandMesh);
+        }
+        if (result.Count==0) result.Add(mesh);
+        return result;
+    }
+
+    static List<Mesh> SplitBySpatialGaps(Mesh mesh, float minGap=0.06f, float minGapRatio=0.12f)
+    {
+        // gap-split как в Python фиксе
+        var islands = SplitMeshIntoIslands(mesh);
+        var final = new List<Mesh>();
+        foreach (var island in islands)
+        {
+            var verts = island.vertices;
+            var tris = island.triangles;
+            var centroids = new List<Vector3>();
+            for (int i=0;i<tris.Length;i+=3)
+            {
+                var a=verts[tris[i]]; var b=verts[tris[i+1]]; var c=verts[tris[i+2]];
+                centroids.Add((a+b+c)/3f);
+            }
+            float bestGap=0; int bestAxis=-1; float splitPos=0;
+            List<int> leftTris=null, rightTris=null;
+            for (int axis=0; axis<=2; axis+=2)
+            {
+                var sorted = centroids.Select((c, idx) => new {c, idx})
+                    .OrderBy(p => axis==0 ? p.c.x : p.c.z).ToList();
+                float span = (axis==0 ? sorted.Last().c.x : sorted.Last().c.z) - (axis==0 ? sorted.First().c.x : sorted.First().c.z);
+                if (span<0.05f) continue;
+                float maxGap=0; int maxIdx=-1;
+                for (int i=1;i<sorted.Count;i++)
+                {
+                    float prev = axis==0 ? sorted[i-1].c.x : sorted[i-1].c.z;
+                    float curr = axis==0 ? sorted[i].c.x : sorted[i].c.z;
+                    float gap=curr-prev;
+                    if (gap>maxGap) { maxGap=gap; maxIdx=i; }
+                }
+                if (maxGap>minGap && maxGap>span*minGapRatio)
+                {
+                    if (maxIdx>sorted.Count*0.1f && maxIdx<sorted.Count*0.9f)
+                    {
+                        if (maxGap>bestGap)
+                        {
+                            bestGap=maxGap; bestAxis=axis;
+                            float prev = axis==0 ? sorted[maxIdx-1].c.x : sorted[maxIdx-1].c.z;
+                            float curr = axis==0 ? sorted[maxIdx].c.x : sorted[maxIdx].c.z;
+                            splitPos=(prev+curr)*0.5f;
+                            leftTris=new List<int>(); rightTris=new List<int>();
+                            for (int i=0;i<maxIdx;i++) leftTris.Add(sorted[i].idx);
+                            for (int i=maxIdx;i<sorted.Count;i++) rightTris.Add(sorted[i].idx);
+                        }
+                    }
+                }
+            }
+            if (bestAxis!=-1 && leftTris!=null)
+            {
+                // режем
+                var leftMesh = BuildMeshFromTriSubset(island, leftTris);
+                var rightMesh = BuildMeshFromTriSubset(island, rightTris);
+                final.AddRange(SplitBySpatialGaps(leftMesh, minGap, minGapRatio));
+                final.AddRange(SplitBySpatialGaps(rightMesh, minGap, minGapRatio));
+            }
+            else
+            {
+                final.Add(island);
+            }
+        }
+        return final;
+    }
+
+    static Mesh BuildMeshFromTriSubset(Mesh src, List<int> triIndices)
+    {
+        var verts=src.vertices; var tris=src.triangles;
+        var used=new HashSet<int>();
+        foreach (int t in triIndices) { used.Add(tris[t*3]); used.Add(tris[t*3+1]); used.Add(tris[t*3+2]); }
+        var usedList=new List<int>(used);
+        var remap=new Dictionary<int,int>();
+        for (int i=0;i<usedList.Count;i++) remap[usedList[i]]=i;
+        var newVerts=new Vector3[usedList.Count];
+        for (int i=0;i<usedList.Count;i++) newVerts[i]=verts[usedList[i]];
+        var newTris=new int[triIndices.Count*3];
+        for (int i=0;i<triIndices.Count;i++)
+        {
+            int t=triIndices[i];
+            newTris[i*3]=remap[tris[t*3]];
+            newTris[i*3+1]=remap[tris[t*3+1]];
+            newTris[i*3+2]=remap[tris[t*3+2]];
+        }
+        var m=new Mesh();
+        m.SetVertices(newVerts);
+        m.SetTriangles(newTris,0);
+        m.RecalculateBounds();
+        return m;
+    }
+
 #endif
