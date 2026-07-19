@@ -127,6 +127,27 @@ public sealed class S4ColliderOptimizer : EditorWindow
                 if (t != null) DestroyImmediate(t.gameObject);
             }
 
+            // === ДОБАВЬ ЭТОТ БЛОК ПОСЛЕ УДАЛЕНИЯ ДИСЕЙБЛЕННЫХ МЕШКОЛЛАЙДЕРОВ ===
+
+            // Второй проход: валидация созданных коллайдеров против вершин визуальных мешей
+            var validationSettings = new ColliderValidationSettings
+            {
+                minVertexCoverage = 0.15f,      // Удалить, если < 15% вершин внутри
+                maxEmptyVolumeRatio = 0.85f,    // Удалить, если > 85% пустого объёма
+                shrinkMargin = 0.02f,           // Запас 2 см при сужении
+                enableShrinking = true,
+                enableRemoval = true,
+                logDetails = logFitDetails       // Используй существующее поле логирования
+            };
+
+            int validationChanges = ValidateAndTightenColliders(root, validationSettings);
+            if (validationChanges > 0 && logFitDetails)
+            {
+                Debug.Log($"[S4 collider optimizer] Validation pass: {validationChanges} colliders adjusted/removed.");
+            }
+
+            // === КОНЕЦ ДОБАВЛЕННОГО БЛОКА ===
+
             // Count survivors for a clearer log line.
             int remainingMeshes = root.GetComponentsInChildren<MeshCollider>(true).Length;
             int boxes = 0, capsules = 0, spheres = 0, primitives = 0;
@@ -854,169 +875,7 @@ public sealed class S4ColliderOptimizer : EditorWindow
         mi.SaveAndReimport();
         Mesh reloaded = AssetDatabase.LoadAssetAtPath<Mesh>(path);
         if (reloaded != null) mc.sharedMesh = reloaded;
-        
-    // FIXED: разбивает меш на острова по связности треугольников
-    // Это решает проблему когда 2 ножки в одном меше дают 1 огромный бокс между ними
-    static List<Mesh> SplitMeshIntoIslands(Mesh mesh)
-    {
-        var result = new List<Mesh>();
-        if (mesh == null) return result;
-        var vertices = mesh.vertices;
-        var triangles = mesh.triangles;
-        if (vertices.Length < 4 || triangles.Length < 6) { result.Add(mesh); return result; }
-
-        var vertToTris = new List<int>[vertices.Length];
-        for (int i = 0; i < vertToTris.Length; i++) vertToTris[i] = new List<int>();
-        for (int ti = 0; ti < triangles.Length; ti += 3)
-        {
-            int a = triangles[ti], b = triangles[ti+1], c = triangles[ti+2];
-            if (a < vertToTris.Length) vertToTris[a].Add(ti/3);
-            if (b < vertToTris.Length) vertToTris[b].Add(ti/3);
-            if (c < vertToTris.Length) vertToTris[c].Add(ti/3);
-        }
-        var visited = new bool[triangles.Length/3];
-        for (int start = 0; start < visited.Length; start++)
-        {
-            if (visited[start]) continue;
-            var queue = new Queue<int>();
-            queue.Enqueue(start);
-            visited[start] = true;
-            var islandTris = new List<int>();
-            while (queue.Count > 0)
-            {
-                int t = queue.Dequeue();
-                islandTris.Add(t);
-                int baseIdx = t*3;
-                int av = triangles[baseIdx], bv = triangles[baseIdx+1], cv = triangles[baseIdx+2];
-                foreach (int v in new int[]{av,bv,cv})
-                {
-                    if (v >= vertToTris.Length) continue;
-                    foreach (int nt in vertToTris[v])
-                    {
-                        if (!visited[nt]) { visited[nt]=true; queue.Enqueue(nt); }
-                    }
-                }
-            }
-            var used = new HashSet<int>();
-            foreach (int t in islandTris)
-            {
-                used.Add(triangles[t*3]); used.Add(triangles[t*3+1]); used.Add(triangles[t*3+2]);
-            }
-            if (used.Count < 4) continue;
-            var usedList = new List<int>(used);
-            var remap = new Dictionary<int,int>();
-            for (int i=0;i<usedList.Count;i++) remap[usedList[i]]=i;
-            var newVerts = new Vector3[usedList.Count];
-            for (int i=0;i<usedList.Count;i++) newVerts[i]=vertices[usedList[i]];
-            var newTris = new int[islandTris.Count*3];
-            for (int i=0;i<islandTris.Count;i++)
-            {
-                int t=islandTris[i];
-                newTris[i*3]=remap[triangles[t*3]];
-                newTris[i*3+1]=remap[triangles[t*3+1]];
-                newTris[i*3+2]=remap[triangles[t*3+2]];
-            }
-            var islandMesh = new Mesh();
-            islandMesh.name = mesh.name + "_island" + result.Count;
-            islandMesh.SetVertices(newVerts);
-            islandMesh.SetTriangles(newTris, 0);
-            islandMesh.RecalculateBounds();
-            result.Add(islandMesh);
-        }
-        if (result.Count==0) result.Add(mesh);
-        return result;
-    }
-
-    static List<Mesh> SplitBySpatialGaps(Mesh mesh, float minGap=0.06f, float minGapRatio=0.12f)
-    {
-        // gap-split как в Python фиксе
-        var islands = SplitMeshIntoIslands(mesh);
-        var final = new List<Mesh>();
-        foreach (var island in islands)
-        {
-            var verts = island.vertices;
-            var tris = island.triangles;
-            var centroids = new List<Vector3>();
-            for (int i=0;i<tris.Length;i+=3)
-            {
-                var a=verts[tris[i]]; var b=verts[tris[i+1]]; var c=verts[tris[i+2]];
-                centroids.Add((a+b+c)/3f);
-            }
-            float bestGap=0; int bestAxis=-1; float splitPos=0;
-            List<int> leftTris=null, rightTris=null;
-            for (int axis=0; axis<=2; axis+=2)
-            {
-                var sorted = centroids.Select((c, idx) => new {c, idx})
-                    .OrderBy(p => axis==0 ? p.c.x : p.c.z).ToList();
-                float span = (axis==0 ? sorted.Last().c.x : sorted.Last().c.z) - (axis==0 ? sorted.First().c.x : sorted.First().c.z);
-                if (span<0.05f) continue;
-                float maxGap=0; int maxIdx=-1;
-                for (int i=1;i<sorted.Count;i++)
-                {
-                    float prev = axis==0 ? sorted[i-1].c.x : sorted[i-1].c.z;
-                    float curr = axis==0 ? sorted[i].c.x : sorted[i].c.z;
-                    float gap=curr-prev;
-                    if (gap>maxGap) { maxGap=gap; maxIdx=i; }
-                }
-                if (maxGap>minGap && maxGap>span*minGapRatio)
-                {
-                    if (maxIdx>sorted.Count*0.1f && maxIdx<sorted.Count*0.9f)
-                    {
-                        if (maxGap>bestGap)
-                        {
-                            bestGap=maxGap; bestAxis=axis;
-                            float prev = axis==0 ? sorted[maxIdx-1].c.x : sorted[maxIdx-1].c.z;
-                            float curr = axis==0 ? sorted[maxIdx].c.x : sorted[maxIdx].c.z;
-                            splitPos=(prev+curr)*0.5f;
-                            leftTris=new List<int>(); rightTris=new List<int>();
-                            for (int i=0;i<maxIdx;i++) leftTris.Add(sorted[i].idx);
-                            for (int i=maxIdx;i<sorted.Count;i++) rightTris.Add(sorted[i].idx);
-                        }
-                    }
-                }
-            }
-            if (bestAxis!=-1 && leftTris!=null)
-            {
-                // режем
-                var leftMesh = BuildMeshFromTriSubset(island, leftTris);
-                var rightMesh = BuildMeshFromTriSubset(island, rightTris);
-                final.AddRange(SplitBySpatialGaps(leftMesh, minGap, minGapRatio));
-                final.AddRange(SplitBySpatialGaps(rightMesh, minGap, minGapRatio));
-            }
-            else
-            {
-                final.Add(island);
-            }
-        }
-        return final;
-    }
-
-    static Mesh BuildMeshFromTriSubset(Mesh src, List<int> triIndices)
-    {
-        var verts=src.vertices; var tris=src.triangles;
-        var used=new HashSet<int>();
-        foreach (int t in triIndices) { used.Add(tris[t*3]); used.Add(tris[t*3+1]); used.Add(tris[t*3+2]); }
-        var usedList=new List<int>(used);
-        var remap=new Dictionary<int,int>();
-        for (int i=0;i<usedList.Count;i++) remap[usedList[i]]=i;
-        var newVerts=new Vector3[usedList.Count];
-        for (int i=0;i<usedList.Count;i++) newVerts[i]=verts[usedList[i]];
-        var newTris=new int[triIndices.Count*3];
-        for (int i=0;i<triIndices.Count;i++)
-        {
-            int t=triIndices[i];
-            newTris[i*3]=remap[tris[t*3]];
-            newTris[i*3+1]=remap[tris[t*3+1]];
-            newTris[i*3+2]=remap[tris[t*3+2]];
-        }
-        var m=new Mesh();
-        m.SetVertices(newVerts);
-        m.SetTriangles(newTris,0);
-        m.RecalculateBounds();
-        return m;
-    }
-
-#endif
+        #endif
     }
 
     // ---------- Capsule fit ----------
@@ -1579,7 +1438,6 @@ public sealed class S4ColliderOptimizer : EditorWindow
     static bool IsFinite(Vector3 v) =>
         !(float.IsNaN(v.x)||float.IsNaN(v.y)||float.IsNaN(v.z)||
           float.IsInfinity(v.x)||float.IsInfinity(v.y)||float.IsInfinity(v.z));
-}
 
     // FIXED: разбивает меш на острова по связности треугольников
     // Это решает проблему когда 2 ножки в одном меше дают 1 огромный бокс между ними
@@ -1742,4 +1600,517 @@ public sealed class S4ColliderOptimizer : EditorWindow
         return m;
     }
 
+    // =====================================================
+    // ВТОРОЙ ПРОХОД ВАЛИДАЦИИ КОЛЛАЙДЕРОВ
+    // Код из S4ColliderOptimizer_ValidationPass.cs
+    // =====================================================
+
+    /// <summary>
+    /// Результат валидации одного коллайдера против вершин модели
+    /// </summary>
+    public sealed class ColliderValidationResult
+    {
+        public Collider collider;
+        public MeshCollider sourceMeshCollider; // оригинальный MeshCollider, из которого создан
+        public Mesh visualMesh; // визуальная сетка, против которой проверяем
+        public int totalVertices;
+        public int verticesInside;
+        public int verticesOutside;
+        public float coverageRatio; // verticesInside / totalVertices
+        public float emptyVolumeRatio; // 1 - (объём вершин внутри / объём коллайдера) примерно
+        public bool shouldRemove;
+        public bool shouldShrink;
+        public Vector3 suggestedSize;
+        public Vector3 suggestedCenter;
+        public Quaternion suggestedRotation;
+        public string debugInfo;
+    }
+
+    /// <summary>
+    /// Настройки второго прохода валидации
+    /// </summary>
+    [System.Serializable]
+    public class ColliderValidationSettings
+    {
+        [Range(0f, 1f)] public float minVertexCoverage = 0.15f; // мин. доля вершин внутри коллайдера
+        [Range(0f, 1f)] public float maxEmptyVolumeRatio = 0.85f; // макс. доля пустого объёма
+        [Range(0f, 0.5f)] public float shrinkMargin = 0.02f; // запас при сужении (в единицах Unity)
+        public bool enableShrinking = true;
+        public bool enableRemoval = true;
+        public bool logDetails = true;
+    }
+
+    /// <summary>
+    /// Основной метод второго прохода: проверяет все созданные коллайдеры против вершин визуальных мешей
+    /// </summary>
+    public static int ValidateAndTightenColliders(GameObject root, ColliderValidationSettings settings = null)
+    {
+        if (root == null) return 0;
+        if (settings == null) settings = new ColliderValidationSettings();
+
+        // Находим корень сгенерированных коллайдеров
+        Transform generatedRoot = root.transform.Find(GeneratedRootName);
+        if (generatedRoot == null)
+        {
+            if (settings.logDetails) Debug.Log("[S4 Validation] No generated colliders root found.");
+            return 0;
+        }
+
+        // Собираем все визуальные MeshFilter'ы в префабе (кроме тех, что под GeneratedRoot)
+        var visualMeshes = new List<MeshFilter>();
+        foreach (var mf in root.GetComponentsInChildren<MeshFilter>(true))
+        {
+            if (mf == null || mf.sharedMesh == null) continue;
+            if (IsUnderGeneratedRoot(mf.transform, root.transform)) continue;
+            visualMeshes.Add(mf);
+        }
+
+        if (visualMeshes.Count == 0)
+        {
+            if (settings.logDetails) Debug.Log("[S4 Validation] No visual meshes found to validate against.");
+            return 0;
+        }
+
+        // Собираем все созданные коллайдеры
+        var allColliders = new List<Collider>();
+        allColliders.AddRange(generatedRoot.GetComponentsInChildren<BoxCollider>(true));
+        allColliders.AddRange(generatedRoot.GetComponentsInChildren<CapsuleCollider>(true));
+        allColliders.AddRange(generatedRoot.GetComponentsInChildren<SphereCollider>(true));
+        // Parametric primitives — это MeshCollider'ы под GeneratedRoot
+        allColliders.AddRange(generatedRoot.GetComponentsInChildren<MeshCollider>(true)
+            .Where(mc => mc != null && mc.sharedMesh != null && mc.convex));
+
+        if (allColliders.Count == 0)
+        {
+            if (settings.logDetails) Debug.Log("[S4 Validation] No colliders to validate.");
+            return 0;
+        }
+
+        int removed = 0;
+        int shrunk = 0;
+        int kept = 0;
+
+        foreach (var col in allColliders)
+        {
+            if (col == null) continue;
+
+            // Находим соответствующий визуальный меш
+            // Эвристика: коллайдер создан из MeshCollider'а с похожим именем или в той же иерархии
+            Mesh visualMesh = ValidationFindBestVisualMesh(col, visualMeshes, root.transform);
+            if (visualMesh == null)
+            {
+                if (settings.logDetails)
+                    Debug.Log($"[S4 Validation] {col.name}: no matching visual mesh found, keeping as-is.");
+                kept++;
+                continue;
+            }
+
+            var result = ValidationValidateColliderAgainstMesh(col, visualMesh, root.transform, settings);
+
+            if (settings.logDetails)
+            {
+                Debug.Log($"[S4 Validation] {col.name} vs {visualMesh.name}: " +
+                          $"coverage={result.coverageRatio:P1}, emptyVol={result.emptyVolumeRatio:P1}, " +
+                          $"remove={result.shouldRemove}, shrink={result.shouldShrink} - {result.debugInfo}");
+            }
+
+            if (result.shouldRemove && settings.enableRemoval)
+            {
+                // Удаляем коллайдер целиком
+                Undo.DestroyObjectImmediate(col.gameObject);
+                removed++;
+            }
+            else if (result.shouldShrink && settings.enableShrinking)
+            {
+                // Сужаем коллайдер
+                ValidationApplyShrink(col, result, settings.shrinkMargin);
+                shrunk++;
+            }
+            else
+            {
+                kept++;
+            }
+        }
+
+        if (settings.logDetails)
+        {
+            Debug.Log($"[S4 Validation] Done: {kept} kept, {shrunk} shrunk, {removed} removed. Total was {allColliders.Count}.");
+        }
+
+        return removed + shrunk;
+    }
+
+    /// <summary>
+    /// Находит лучший визуальный меш для данного коллайдера
+    /// </summary>
+    static Mesh ValidationFindBestVisualMesh(Collider col, List<MeshFilter> visualMeshes, Transform rootTransform)
+    {
+        // Получаем мировые границы коллайдера
+        Bounds colBounds = ValidationGetColliderWorldBounds(col);
+
+        Mesh bestMesh = null;
+        float bestScore = float.MaxValue;
+
+        foreach (var mf in visualMeshes)
+        {
+            if (mf == null || mf.sharedMesh == null) continue;
+
+            Bounds meshBounds = mf.sharedMesh.bounds;
+            // Переводим в мировое пространство
+            Matrix4x4 localToWorld = mf.transform.localToWorldMatrix;
+            Vector3 center = localToWorld.MultiplyPoint(meshBounds.center);
+            Vector3 size = Vector3.Scale(meshBounds.size, mf.transform.lossyScale);
+            Bounds worldMeshBounds = new Bounds(center, size);
+
+            // Считаем перекрытие
+            float overlap = ValidationBoundsOverlapRatio(colBounds, worldMeshBounds);
+            float distance = Vector3.Distance(colBounds.center, worldMeshBounds.center);
+
+            // Скор: меньше = лучше (больше перекрытие, меньше расстояние)
+            float score = (1f - overlap) * 10f + distance;
+
+            if (score < bestScore)
+            {
+                bestScore = score;
+                bestMesh = mf.sharedMesh;
+            }
+        }
+
+        return bestMesh;
+    }
+
+    /// <summary>
+    /// Получает мировые границы коллайдера любого типа
+    /// </summary>
+    static Bounds ValidationGetColliderWorldBounds(Collider col)
+    {
+        if (col is BoxCollider bc)
+        {
+            return new Bounds(
+                bc.transform.TransformPoint(bc.center),
+                Vector3.Scale(bc.size, bc.transform.lossyScale)
+            );
+        }
+        else if (col is CapsuleCollider cc)
+        {
+            // Капсула: вычисляем AABB
+            Vector3 center = cc.transform.TransformPoint(cc.center);
+            float radius = cc.radius * Mathf.Max(cc.transform.lossyScale.x, cc.transform.lossyScale.z);
+            float halfHeight = cc.height * 0.5f * cc.transform.lossyScale.y;
+            Vector3 size = new Vector3(radius * 2f, halfHeight * 2f + radius * 2f, radius * 2f);
+            return new Bounds(center, size);
+        }
+        else if (col is SphereCollider sc)
+        {
+            Vector3 center = sc.transform.TransformPoint(sc.center);
+            float radius = sc.radius * Mathf.Max(sc.transform.lossyScale.x, sc.transform.lossyScale.y, sc.transform.lossyScale.z);
+            return new Bounds(center, Vector3.one * radius * 2f);
+        }
+        else if (col is MeshCollider mc && mc.sharedMesh != null)
+        {
+            return mc.bounds;
+        }
+        return new Bounds(col.transform.position, Vector3.one * 0.01f);
+    }
+
+    /// <summary>
+    /// Коэффициент перекрытия двух AABB (0..1)
+    /// </summary>
+    static float ValidationBoundsOverlapRatio(Bounds a, Bounds b)
+    {
+        Vector3 min = Vector3.Max(a.min, b.min);
+        Vector3 max = Vector3.Min(a.max, b.max);
+        Vector3 inter = Vector3.Max(Vector3.zero, max - min);
+        float interVol = inter.x * inter.y * inter.z;
+        float aVol = a.size.x * a.size.y * a.size.z;
+        float bVol = b.size.x * b.size.y * b.size.z;
+        float union = aVol + bVol - interVol;
+        return union > 0f ? interVol / union : 0f;
+    }
+
+    /// <summary>
+    /// Валидирует один коллайдер против вершин меша
+    /// </summary>
+    static ColliderValidationResult ValidationValidateColliderAgainstMesh(
+        Collider col, Mesh visualMesh, Transform rootTransform, ColliderValidationSettings settings)
+    {
+        var result = new ColliderValidationResult
+        {
+            collider = col,
+            visualMesh = visualMesh
+        };
+
+        // Получаем вершины визуального меша в мировом пространстве
+        Vector3[] vertices = visualMesh.vertices;
+        if (vertices == null || vertices.Length == 0)
+        {
+            result.debugInfo = "empty mesh";
+            result.shouldRemove = true;
+            return result;
+        }
+
+        // Находим MeshFilter для этого меша, чтобы получить правильный transform
+        MeshFilter mf = ValidationFindMeshFilterForMesh(visualMesh, rootTransform);
+        Matrix4x4 localToWorld = mf != null ? mf.transform.localToWorldMatrix : rootTransform.localToWorldMatrix;
+
+        result.totalVertices = vertices.Length;
+        int inside = 0;
+
+        // Проверяем каждую вершину
+        for (int i = 0; i < vertices.Length; i++)
+        {
+            Vector3 worldVertex = localToWorld.MultiplyPoint(vertices[i]);
+            if (ValidationIsPointInCollider(worldVertex, col))
+                inside++;
+        }
+
+        result.verticesInside = inside;
+        result.verticesOutside = result.totalVertices - inside;
+        result.coverageRatio = result.totalVertices > 0 ? (float)inside / result.totalVertices : 0f;
+
+        // Оценка пустого объёма: объём коллайдера vs объём выпуклой оболочки вершин внутри
+        float colVolume = ValidationGetColliderVolume(col);
+        float verticesVolume = ValidationEstimateVerticesVolume(vertices, localToWorld, col);
+        result.emptyVolumeRatio = colVolume > 0f ? 1f - (verticesVolume / colVolume) : 1f;
+        result.emptyVolumeRatio = Mathf.Clamp01(result.emptyVolumeRatio);
+
+        // Решение: удалять или сужать
+        result.shouldRemove = result.coverageRatio < settings.minVertexCoverage
+                           || result.emptyVolumeRatio > settings.maxEmptyVolumeRatio;
+
+        result.shouldShrink = !result.shouldRemove
+                           && result.coverageRatio < 0.5f // если покрытие не полное
+                           && result.emptyVolumeRatio > 0.3f; // и есть заметный пустой объём
+
+        // Предлагаем новый размер/центр на основе bounding box вершин внутри
+        if (result.shouldShrink)
+        {
+            ValidationComputeTightBounds(vertices, localToWorld, col, out result.suggestedCenter, out result.suggestedSize, out result.suggestedRotation);
+        }
+
+        result.debugInfo = $"vertsIn={inside}/{result.totalVertices}, colVol={colVolume:F4}, vertVol≈{verticesVolume:F4}";
+        return result;
+    }
+
+    /// <summary>
+    /// Находит MeshFilter для данного меша в иерархии
+    /// </summary>
+    static MeshFilter ValidationFindMeshFilterForMesh(Mesh mesh, Transform root)
+    {
+        foreach (var mf in root.GetComponentsInChildren<MeshFilter>(true))
+        {
+            if (mf.sharedMesh == mesh) return mf;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Проверяет, находится ли точка внутри коллайдера
+    /// </summary>
+    static bool ValidationIsPointInCollider(Vector3 worldPoint, Collider col)
+    {
+        if (col is BoxCollider bc)
+        {
+            Vector3 local = bc.transform.InverseTransformPoint(worldPoint) - bc.center;
+            Vector3 halfSize = bc.size * 0.5f;
+            return Mathf.Abs(local.x) <= halfSize.x &&
+                   Mathf.Abs(local.y) <= halfSize.y &&
+                   Mathf.Abs(local.z) <= halfSize.z;
+        }
+        else if (col is CapsuleCollider cc)
+        {
+            Vector3 local = cc.transform.InverseTransformPoint(worldPoint) - cc.center;
+            int dir = cc.direction; // 0=X, 1=Y, 2=Z
+            float radius = cc.radius;
+            float halfHeight = cc.height * 0.5f;
+
+            // Проекция на ось капсулы
+            float axial = (dir == 0) ? local.x : (dir == 1) ? local.y : local.z;
+            Vector2 radial = (dir == 0) ? new Vector2(local.y, local.z)
+                             : (dir == 1) ? new Vector2(local.x, local.z)
+                             : new Vector2(local.x, local.y);
+
+            float radialDist = radial.magnitude;
+            if (radialDist > radius) return false;
+
+            // Проверяем расстояние до концов капсулы
+            if (axial > halfHeight)
+                return (axial - halfHeight) * (axial - halfHeight) + radialDist * radialDist <= radius * radius;
+            if (axial < -halfHeight)
+                return (-halfHeight - axial) * (-halfHeight - axial) + radialDist * radialDist <= radius * radius;
+            return true;
+        }
+        else if (col is SphereCollider sc)
+        {
+            Vector3 local = sc.transform.InverseTransformPoint(worldPoint) - sc.center;
+            return local.sqrMagnitude <= sc.radius * sc.radius;
+        }
+        else if (col is MeshCollider mc && mc.sharedMesh != null && mc.convex)
+        {
+            // Для convex MeshCollider используем bounds как грубую оценку
+            return mc.bounds.Contains(worldPoint);
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Приблизительный объём коллайдера
+    /// </summary>
+    static float ValidationGetColliderVolume(Collider col)
+    {
+        if (col is BoxCollider bc)
+            return bc.size.x * bc.size.y * bc.size.z;
+        if (col is CapsuleCollider cc)
+        {
+            float r = cc.radius;
+            float h = cc.height;
+            // Объём цилиндра + сфера (два полушария = сфера)
+            return Mathf.PI * r * r * Mathf.Max(0f, h - 2f * r) + (4f / 3f) * Mathf.PI * r * r * r;
+        }
+        if (col is SphereCollider sc)
+            return (4f / 3f) * Mathf.PI * sc.radius * sc.radius * sc.radius;
+        if (col is MeshCollider mc && mc.sharedMesh != null)
+            return mc.bounds.size.x * mc.bounds.size.y * mc.bounds.size.z;
+        return 0f;
+    }
+
+    /// <summary>
+    /// Оценка объёма, занятого вершинами внутри коллайдера
+    /// </summary>
+    static float ValidationEstimateVerticesVolume(Vector3[] vertices, Matrix4x4 localToWorld, Collider col)
+    {
+        // Собираем вершины, которые внутри коллайдера
+        var insideVerts = new List<Vector3>();
+        for (int i = 0; i < vertices.Length; i++)
+        {
+            Vector3 w = localToWorld.MultiplyPoint(vertices[i]);
+            if (ValidationIsPointInCollider(w, col))
+                insideVerts.Add(w);
+        }
+
+        if (insideVerts.Count < 4) return 0f;
+
+        // Грубая оценка: AABB вершин внутри
+        Vector3 min = insideVerts[0], max = insideVerts[0];
+        foreach (var v in insideVerts)
+        {
+            min = Vector3.Min(min, v);
+            max = Vector3.Max(max, v);
+        }
+        Vector3 size = max - min;
+        return size.x * size.y * size.z;
+    }
+
+    /// <summary>
+    /// Вычисляет плотные границы (OBB) для вершин внутри коллайдера через PCA
+    /// </summary>
+    static void ValidationComputeTightBounds(Vector3[] vertices, Matrix4x4 localToWorld, Collider col,
+        out Vector3 center, out Vector3 size, out Quaternion rotation)
+    {
+        var insideVerts = new List<Vector3>();
+        for (int i = 0; i < vertices.Length; i++)
+        {
+            Vector3 w = localToWorld.MultiplyPoint(vertices[i]);
+            if (ValidationIsPointInCollider(w, col))
+                insideVerts.Add(w);
+        }
+
+        if (insideVerts.Count < 4)
+        {
+            center = col.bounds.center;
+            size = col.bounds.size;
+            rotation = Quaternion.identity;
+            return;
+        }
+
+        // PCA для нахождения главных осей
+        Vector3 mean = Vector3.zero;
+        foreach (var v in insideVerts) mean += v;
+        mean /= insideVerts.Count;
+
+        float xx = 0, xy = 0, xz = 0, yy = 0, yz = 0, zz = 0;
+        foreach (var v in insideVerts)
+        {
+            Vector3 d = v - mean;
+            xx += d.x * d.x; xy += d.x * d.y; xz += d.x * d.z;
+            yy += d.y * d.y; yz += d.y * d.z; zz += d.z * d.z;
+        }
+
+        // Power iteration для главной оси
+        Vector3 major = new Vector3(0.73f, 0.41f, 0.55f).normalized;
+        for (int i = 0; i < 20; i++)
+        {
+            Vector3 w = new Vector3(xx * major.x + xy * major.y + xz * major.z,
+                                    xy * major.x + yy * major.y + yz * major.z,
+                                    xz * major.x + yz * major.y + zz * major.z);
+            if (w.sqrMagnitude < 1e-12f) break;
+            major = w.normalized;
+        }
+
+        // Вторая ось
+        Vector3 second = new Vector3(0.17f, 0.91f, 0.37f).normalized;
+        second -= major * Vector3.Dot(second, major);
+        if (second.sqrMagnitude < 1e-8f) second = Vector3.Cross(major, Vector3.up).normalized;
+        second = second.normalized;
+
+        Vector3 third = Vector3.Cross(major, second).normalized;
+        second = Vector3.Cross(third, major).normalized;
+
+        rotation = Quaternion.LookRotation(third, second);
+        Quaternion invRot = Quaternion.Inverse(rotation);
+
+        Vector3 min = new Vector3(float.PositiveInfinity, float.PositiveInfinity, float.PositiveInfinity);
+        Vector3 max = new Vector3(float.NegativeInfinity, float.NegativeInfinity, float.NegativeInfinity);
+        foreach (var v in insideVerts)
+        {
+            Vector3 q = invRot * (v - mean);
+            min = Vector3.Min(min, q);
+            max = Vector3.Max(max, q);
+        }
+
+        size = max - min;
+        center = mean + rotation * ((min + max) * 0.5f);
+    }
+
+    /// <summary>
+    /// Применяет сужение к коллайдеру
+    /// </summary>
+    static void ValidationApplyShrink(Collider col, ColliderValidationResult result, float margin)
+    {
+        Undo.RecordObject(col, "Shrink collider after validation");
+
+        if (col is BoxCollider bc)
+        {
+            bc.center = bc.transform.InverseTransformPoint(result.suggestedCenter);
+            bc.size = Vector3.Max(Vector3.one * 0.001f, result.suggestedSize + Vector3.one * margin * 2f);
+            bc.transform.rotation = result.suggestedRotation;
+        }
+        else if (col is CapsuleCollider cc)
+        {
+            // Для капсулы сужаем радиус и высоту на основе предложенных границ
+            cc.center = cc.transform.InverseTransformPoint(result.suggestedCenter);
+            float newHeight = Mathf.Max(2f * cc.radius, result.suggestedSize.y);
+            float newRadius = Mathf.Max(0.001f, Mathf.Max(result.suggestedSize.x, result.suggestedSize.z) * 0.5f);
+            cc.height = newHeight + margin * 2f;
+            cc.radius = newRadius + margin;
+            cc.transform.rotation = result.suggestedRotation;
+        }
+        else if (col is SphereCollider sc)
+        {
+            sc.center = sc.transform.InverseTransformPoint(result.suggestedCenter);
+            sc.radius = Mathf.Max(0.001f, Mathf.Max(result.suggestedSize.x, result.suggestedSize.y, result.suggestedSize.z) * 0.5f + margin);
+        }
+        else if (col is MeshCollider mc)
+        {
+            // Для MeshCollider'ов (parametric primitives) лучше не трогать
+        }
+
+        EditorUtility.SetDirty(col);
+    }
+
+    // =====================================================
+    // КОНЕЦ ВТОРОГО ПРОХОДА ВАЛИДАЦИИ
+    // =====================================================
+
 #endif
+}
